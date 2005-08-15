@@ -1,0 +1,608 @@
+package Class::Inflate;
+
+use 5.006;
+use strict;
+use warnings;
+
+require Exporter;
+
+our @ISA = qw(Exporter);
+our @EXPORT_OK = qw(inflate commit obliterate);
+our @EXPORT = ('inflate'); # @EXPORT_OK;
+our $VERSION = '0.01';
+
+use Devel::Messenger qw(note);
+
+# Preloaded methods go here.
+
+sub import {
+    # allows 'use' syntax
+    my ($class, @args) = @_;
+    @args and $class->make(@args);
+}
+
+sub make {
+    # sets up glue to database based on 'use' statement
+    my ($generator_class, @args) = @_;
+    my $target_class = $generator_class->find_target_class;
+    my %persist = ();
+    while (@args) {
+        my ($table, $config) = splice(@args, 0, 2);
+	$persist{$table} = $config;
+    }
+    # $generator_class->_install_method($target_class, $sub_name, $code);
+    foreach my $export (@EXPORT) {
+        my $generate_export = '_' . $export;
+	$generator_class->$generate_export($target_class, \%persist, $export);
+    }
+}
+
+sub find_target_class {
+    # determines where to export generated methods
+    my $class;
+    my $c = 0;
+    while (1) {
+        $class = (caller($c++))[0];
+        last unless ($class->isa('Class::Inflate') and
+                     &{$class->can('ima_generator')});
+    }
+    return $class;
+}
+
+sub ima_generator {
+    # a subclass may redefine this to return 0, if it wishes
+    # to allow methods added to itself
+    1;
+}
+
+sub _install_method {
+    # exports method to target class
+    my $generator_class = shift;
+    my $target_class = shift;
+    my $accessor = shift;
+    my $code = shift;
+    no strict 'refs';
+    unless (defined *{"$target_class\::$accessor"}{CODE}) {
+        note \7, "building accessor '$target_class\::$accessor'\n";
+        return *{"$target_class\::$accessor"} = $code;
+    }
+    return;
+}
+
+sub _inflate {
+    my $generator_class = shift;
+    my $target_class = shift;
+    my $persist = shift;
+    my $sub_name = shift;
+    $generator_class->_install_method($target_class, $sub_name, sub {
+	my $self = shift;
+	my $class = ref($self) ? ref($self) : $self;
+	my $dbh = shift;
+	my $filter = shift || $self;
+	my @sql = inflation_sql($class, $filter, $persist);
+	my @records = (); # in object format
+	my @data = (); # in table/field format
+	my %rows_fetched = ();
+	my %awaiting_join = ();
+	foreach my $sql (@sql) {
+	    my @r = fetchrows($class, $dbh, $sql->{query}, $sql->{bind});
+	    $rows_fetched{$sql->{table}} = \@r;
+	    if (exists($persist->{$sql->{table}}{join})) {
+	        foreach my $table (keys %{$persist->{$sql->{table}}{join}}) {
+		    note \3, "want to join $sql->{table} to $table\n";
+		    if (@data and $rows_fetched{$table}) {
+			join_records($class, $persist, $table, \@data, $sql->{table}, \@r);
+		    } else {
+			$awaiting_join{$table} ||= [];
+		        push @{$awaiting_join{$table}}, $sql->{table};
+			note \3, "  will wait till we have $table data\n";
+		    }
+		}
+	    } else {
+	        # this is the master/parent table
+		note \3, "populating dataset from $sql->{table}\n";
+		$rows_fetched{$sql->{table}} = @r;
+		@data = map { { $sql->{table} => [$_] } } splice @r;
+		note \3, "placed " . scalar(@data) . ' of ' . scalar(@r) . " records in dataset\n"; 
+	    }
+	    if (@data and $awaiting_join{$sql->{table}}) {
+		note \3, "now we have $sql->{table} data\n";
+		foreach my $table (@{$awaiting_join{$sql->{table}}}) {
+		    join_records($class, $persist, $sql->{table}, \@data, $table, $rows_fetched{$table});
+		}
+	    }
+	}
+	# TODO remove Dumper
+	#use Data::Dumper;
+	#note "dataset:\n" . Dumper(\@data) . "\n";
+	my $inflated_object = inflated_object($class, $persist, \@data, [ref($self) ? $self : ()]);
+	while (my $record = $inflated_object->()) {
+	    push @records, $record;
+	}
+	return @records if wantarray;
+	return \@records;
+    });
+}
+
+sub inflation_sql {
+    my $class = shift;
+    my $filter = shift;
+    my $persist = shift;
+    die "inflate filter must be a HASH\n" unless (UNIVERSAL::isa($filter, 'HASH'));
+    my @sql = ();
+    my $inflate = [];
+    foreach my $table (keys %$persist) {
+        push @$inflate, keys %{$persist->{$table}{methods}};
+    }
+    my $method_tables = method_tables($class, $persist);
+    my $inflation_fields = inflation_fields($class, $inflate, $persist, $method_tables);
+    my $filter_values = filter_values($class, $filter, $persist, $method_tables);
+    my %join_fields = (); # fields we must select because we will use them to match records
+    # newer code
+    foreach my $table (keys %$inflation_fields) {
+	note \5, "building query for table $table\n";
+	my @tables = ();
+	my @fields = ();
+	my @filter = ();
+	my @bind   = ();
+        my $has_filter = exists($filter_values->{$table}) ? 1 : 0;
+	my $has_external_filter = scalar(keys %$filter_values) > $has_filter;
+	if ($has_external_filter) {
+	    # see if we can join to the external tables
+	    my $matched = 0;
+	    my $need_join = 0;
+	    # add current table and fields
+	    my $alias = 'a';
+	    my %table_alias = ( $table => $alias );
+	    push @tables, $table . ' ' . $table_alias{$table};
+	    push @fields, map { $table_alias{$table} . '.' . $_ } @{$inflation_fields->{$table}};
+	    foreach my $external (keys %$filter_values) {
+		next if ($table eq $external);
+		# add external table
+		$table_alias{$external} = ++$alias;
+		# see if all the fields in the filter join to fields in our table
+	        #foreach my $field (@{$filter_values->{$external}{fields}}) {
+		#    if (exists($persist->{$table}{join}{$external}) and exists($persist->{$table}{join}{$external}{$field})) {
+		#        my $my_field_name = $persist->{$table}{join}{$external}{$field};
+		#	# TODO get value right now?
+		#	$matched++;
+		#    } else {
+		#        $need_join++;
+		#    }
+		#}
+	    }
+	    # add join (field = field) to filter
+	    my @aliases = keys %table_alias;
+	    foreach my $external (@aliases) {
+		next if ($external eq $table);
+		note \6, "will need to join from $table to $external\n";
+		# iterate through tables we know how to join to
+		my $next_path = join_path($persist, $external, keys %{$persist->{$table}{join}});
+		if (my @path = $next_path->()) {
+		    note \6, "path: " . join(' -> ', @path) . "\n";
+		    my $from = $table;
+		    foreach my $step (@path) {
+			# add external table
+			$table_alias{$step} = ++$alias unless (exists($table_alias{$step}));
+			push @tables, $step . ' ' . $table_alias{$step};
+			$join_fields{$step} ||= [];
+			foreach my $field (keys %{$persist->{$from}{join}{$step}}) {
+			    note \6, '  joining ' . $from . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $step . '.' . $field . "\n";
+			    push @filter, $table_alias{$from} . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $table_alias{$step} . '.' . $field;
+			    push @{$join_fields{$from}}, $persist->{$from}{join}{$step}{$field};
+			    push @{$join_fields{$step}}, $field;
+			}
+			$from = $step;
+		    }
+		} else {
+		    note \6, "no path from $table to $external found\n";
+		    delete $table_alias{$external};
+		}
+	    }
+	    foreach my $external (keys %table_alias) {
+		# add external table conditions to filter
+		if (exists($filter_values->{$external})) {
+		    push @filter, map { $table_alias{$external} . '.' . $_ . ' = ?' } @{$filter_values->{$external}{fields}};
+		    push @bind, @{$filter_values->{$external}{values}};
+		}
+	    }
+	    #if ($need_join) {
+	    #    # TODO join in SQL, select from both, remove other single table SQL
+	    #} else {
+	    #    # TODO build SQL using our fieldnames for filter parameters
+	    #}
+	} else {
+	    # build SQL statement for this table - no joins necessary
+	    push @tables, $table;
+	    push @fields, @{$inflation_fields->{$table}};
+	    if (exists($filter_values->{$table})) {
+		push @filter, map { $_ . ' = ?' } @{$filter_values->{$table}{fields}};
+		push @bind,   @{$filter_values->{$table}{values}};
+	    }
+	}
+	next unless @filter;
+	push @sql, { 
+	    'bind' => \@bind, 
+	    'table' => $table,
+	    'tables' => \@tables,
+	    'fields' => \@fields,
+	    'filter' => \@filter,
+	};
+    }
+    foreach my $sql (@sql) {
+	my ($table, $alias) = split(/\s+/, $sql->{tables}[0]);
+	$alias .= $alias ? '.' : '';
+	if (exists($join_fields{$table})) {
+	    my %current = map { $_ => 1 } @{$sql->{fields}};
+	    foreach my $field (@{$join_fields{$table}}) {
+	        unless (exists($current{$alias.$field})) {
+		    push @{$sql->{fields}}, $alias.$field;
+		    $current{$alias.$field}++;
+		    note \6, "adding $table.$field to selection\n";
+		}
+	    }
+	}
+	my $query = 'SELECT ' . join(', ', @{$sql->{fields}});
+	$query .= ' FROM ' . join(', ', @{$sql->{tables}});
+	$query .= ' WHERE ' . join(' AND ', @{$sql->{filter}});
+	$sql->{query} = $query;
+	note \5, 'built query: ' . $query . " -> " . join(', ', @{$sql->{bind}}) . "\n";
+    }
+    return @sql if wantarray;
+    return \@sql;
+}
+
+sub join_path {
+    # determine possible paths to join two tables together
+    my $persist = shift;
+    my $target = shift;
+    my @iterators = ();
+    note \7, "creating base iterator\n";
+    push @iterators, [member_of($target, @_), []];
+    my $c = 0;
+    return sub {
+        while ($c < @iterators) {
+	    my ($element, $match) = $iterators[$c][0]->();
+	    unless (defined($element)) {
+		note \7, "iterator $c is exhausted\n";
+		$c++;
+		next;
+	    }
+	    if ($match) {
+		note \7, "iterator $c found a join path: " . join(' -> ', @{$iterators[$c][1]}, $element) . "\n";
+	        return @{$iterators[$c][1]}, $element;
+	    } else {
+		note \7, "creating iterator from $element\n";
+	        push @iterators, [member_of($target, keys %{$persist->{$element}{join}}), [@{$iterators[$c][1]}, $element]];
+	    }
+	}
+	note \7, "all iterators exhausted\n";
+	return;
+    };
+}
+
+sub member_of {
+    # iterator to say if an element matches the target
+    my $target = shift;
+    my @possible = @_;
+    note \7, "  determining if $target is a member of: " . join('|', @possible) . "\n";
+    return sub {
+        while (my $element = shift(@possible)) {
+	    return ($element, ($element eq $target));
+	}
+	return;
+    }
+}
+
+sub inflation_fields {
+    my $class = shift;
+    my $inflate = shift;
+    my $persist = shift;
+    my $method_tables = shift || method_tables($class, $persist);
+    my %fields = ();
+    foreach my $method (@$inflate) {
+	unless (exists($method_tables->{$method})) {
+	    warn "ignoring unknown method '$method' for inflation\n";
+	    next;
+	}
+        my $table = $method_tables->{$method};
+	next if (exists($fields{$table})); # already did this table
+	my $methods = $persist->{$table}{methods};
+	my @fields = ();
+	# figure out which fields to select based on method names
+	foreach my $field (values %$methods) {
+	    if (ref($field)) {
+	        if (ref($field) eq 'HASH' and exists($field->{fields})) {
+		    push @fields, ref($field->{fields}) eq 'ARRAY' ? @{$field->{fields}} : $field->{fields};
+		}
+	    } else {
+	        push @fields, $field;
+	    }
+	}
+	next unless @fields;
+	# select any fields needed for joins
+	if (exists($persist->{$table}{join})) {
+	    my %selected = map { $_ => 1 } @fields;
+	    foreach my $parent (keys %{$persist->{$table}{join}}) {
+	        foreach my $field (values %{$persist->{$table}{join}{$parent}}) {
+		    unless (exists($selected{$field})) {
+			push @fields, $field;
+			$selected{$field}++;
+		    }
+		}
+	    }
+	}
+	note \6, "will select from table $table\n";
+	note \6, "will select fields " . join(', ', @fields) . "\n";
+	$fields{$table} = \@fields;
+    }
+    return \%fields;
+}
+
+sub filter_values {
+    # returns the table name, field names and bind values for any method name
+    my $class = shift;
+    my $filter = shift;
+    my $persist = shift;
+    my $method_tables = shift || method_tables($class, $persist);
+    my %values = ();
+    foreach my $method (keys %$filter) {
+	if (UNIVERSAL::can($filter, $method)) {
+	    my $value = $filter->$method();
+	    if (!defined($value) or !length($value)) {
+		# undefined values of an object do not count as filter parameters
+	        next;
+	    }
+	}
+	# TODO skip warning if filter is an object, rather than a HASH
+	unless (exists($method_tables->{$method})) {
+	    warn "ignoring unknown filter field '$method'\n";
+	    next;
+	}
+        my $table = $method_tables->{$method};
+	my $methods = $persist->{$table}{methods};
+	note \6, "filtering on $method\n";
+	my $field = $methods->{$method};
+	my @field = ();
+	my @value = ();
+	if (ref($field)) {
+	    if (ref($field) eq 'HASH' and exists($field->{fields})) {
+		push @field, ref($field->{fields}) eq 'ARRAY' ? @{$field->{fields}} : $field->{fields};
+		if (exists($field->{deflate})) {
+		    if (UNIVERSAL::can($filter, $method)) {
+			push @value, $field->{deflate}->($filter->$method());
+		    } else {
+			push @value, $field->{deflate}->($filter->{$method});
+		    }
+		}
+	    }
+	} else {
+	    push @field, $field;
+	    if (UNIVERSAL::can($filter, $method)) {
+		push @value, $filter->$method();
+	    } else {
+		push @value, $filter->{$method};
+	    }
+	}
+	unless (@field == @value) {
+	    warn "filter for $method specified " . scalar(@field) . " fields, but " . scalar(@value) . " values\n";
+	}
+	for (my $i = 0; $i < @field; $i++) {
+	    note \6, "  ($table.$field[$i] = $value[$i])\n";
+	}
+	$values{$table} ||= { 'fields' => [], 'values' => [] };
+	push @{$values{$table}{fields}}, @field;
+	push @{$values{$table}{values}}, @value;
+    }
+    return \%values;
+}
+
+sub fetchrows {
+    my $class = shift;
+    my $dbh = shift;
+    my $query = shift;
+    my $bind = shift;
+    my @records = ();
+    if ($dbh and my $sth = $dbh->prepare($query)) {
+	note \2, $sth->{Statement} . ' -> ' . join(', ', @$bind) . "\n";
+        if ($sth->execute(@$bind)) {
+	    while (my $record = $sth->fetchrow_hashref('NAME_lc')) {
+		push @records, $record;
+	    }
+	}
+    }
+    note \2, "fetched " . scalar(@records) . " records\n";
+    return @records if wantarray;
+    return \@records;
+}
+
+sub join_records {
+    my $class = shift;
+    my $persist = shift;
+    my $parent = shift; # table name
+    my $data = shift; # master dataset
+    my $child = shift; # table name
+    my $records = shift; # records
+    my $join = $persist->{$child}{join}{$parent} || return; # can't join without instructions
+    my %parent = (); # keyed off join identifier
+    my $children = 0; # count matches
+    my %joined = ();
+    note \5, "joining " . scalar(@$records) . " $child to matching $parent records\n";
+    foreach my $d (@$data) {
+	my @identifier = ();
+        foreach my $field (sort keys %$join) {
+	    push @identifier, $field, $d->{$parent}[0]->{lc($field)};
+	}
+	my $identifier = join(':', @identifier);
+	#note \7, "  building parent identifier $identifier\n";
+	push @{$parent{$identifier}}, $d;
+    }
+    foreach my $r (@$records) {
+        my @identifier = ();
+	foreach my $field (sort keys %$join) {
+	    push @identifier, $field, $r->{lc($join->{$field})};
+	}
+	my $identifier = join(':', map { defined($_) ? $_ : '' } @identifier);
+	#note \7, "  building child identifier $identifier\n";
+	if (exists($parent{$identifier})) {
+	    #note \7, "  joining on $identifier\n";
+	    foreach my $d (@{$parent{$identifier}}) {
+		# TODO do not push child record onto data record more than once (in multiple join scenario)
+	        push @{$d->{$child}}, $r;
+		$children++;
+		$joined{$identifier}++;
+	    }
+	}
+    }
+    note \5, "joined $children $child to " . scalar(keys %joined) . " $parent records\n";
+    return $children;
+}
+
+sub inflated_object {
+    # returns iterator to turn table/field data into an object
+    my $class = shift;
+    my $persist = shift;
+    my $data = shift; # ARRAY ref we shift from
+    my $objects = shift; # should only ever contain zero or one objects
+    my $c = 0;
+    return sub {
+        return unless @$data;
+	my $d = shift(@$data);
+	my $object = $objects->[$c++] ||= $class->new();
+	foreach my $table (keys %$d) {
+	    my $records = $d->{$table};
+	    note "[$c] inflating object $class with " . scalar(@$records) . " records from $table\n";
+	    my $methods = $persist->{$table}{methods};
+	    foreach my $method (keys %$methods) {
+		note \6, "inflating method $method\n";
+		my $field = $methods->{$method};
+		if (ref($field)) {
+		    if (ref($field) eq 'HASH' and exists($field->{fields})) {
+			my @field = ();
+			push @field, ref($field->{fields}) eq 'ARRAY' ? @{$field->{fields}} : $field->{fields};
+			if (UNIVERSAL::can($object, $method)) {
+			    my @values = ();
+			    foreach my $record (@$records) {
+				if (exists($field->{inflate})) {
+				    push @values, $field->{inflate}->(@{$record}{@field});
+				} else {
+				    push @values, @{$record}{@field};
+				}
+				foreach my $field (@field) {
+				    note \6, "  ($field = " . (defined($record->{$field}) ? $record->{$field} : '') . ")\n";
+				}
+			    }
+			    if ($field->{forceref} or ($field->{wantref} and @values > 1)) {
+				$object->$method(\@values);
+			    } else {
+				$object->$method(@values);
+			    }
+			} else {
+			    # TODO some warning - can't run method on object
+			}
+		    } elsif (ref($field) eq 'HASH') {
+			if (exists($field->{inflate})) {
+			    push my @values, $field->{inflate}->();
+			    foreach my $value (@values) {
+			        note \6, "  ( = $value)\n";
+			    }
+			    $object->$method(@values);
+			}
+		    }
+		} else {
+		    if (UNIVERSAL::can($object, $method)) {
+			my @values = ();
+			foreach my $record (@$records) {
+			    push @values, $record->{$field};
+			    note \6, "  ($field = " . (defined($record->{$field}) ? $record->{$field} : 'undef') . ")\n";
+			}
+			$object->$method(@values);
+		    } else {
+			# TODO some warning - can't run method on object
+		    }
+		}
+	    }
+	}
+	return $object;
+    };
+}
+
+sub method_tables {
+    my $class = shift;
+    my $persist = shift;
+    my %table = ();
+    foreach my $table (keys %$persist) {
+        foreach my $method (keys %{$persist->{$table}{methods}}) {
+	    $table{$method} = $table;
+	}
+    }
+    return \%table;
+}
+
+1;
+__END__
+
+=head1 NAME
+
+Class::Inflate - Inflate HASH Object from Values in Database
+
+=head1 SYNOPSIS
+
+  # in package
+  package Some::Package::Name;
+  use Class::Inflate (
+      $table_one => {
+          key => \@primary_key_fields,
+	  methods => {
+	      $method_one => $field_one,
+	      $method_two => {
+	          inflate => sub { join('-', @_) },
+		  deflate => sub { split(/-/, shift(), 2) },
+		  fields  => [$field_two, $field_three],
+	      },
+	  },
+      },
+      $table_two => {
+          key => \@primary_key_fields,
+	  join => {
+	      $table_one => {
+	          $field_one => $field_1,
+	      },
+	  },
+	  methods => {
+	      $method_$three => $field_2,
+	  }
+      },
+  );
+
+  # in script
+  use Some::Package::Name;
+  my @objects = Some::Package::Name->inflate({$field_one => $value});
+  
+=head1 DESCRIPTION
+
+Allows for any blessed HASH object to be populated from a database, by
+describing table relationships to each method.
+
+=head2 EXPORT
+
+Exports C<inflate> method into caller's namespace.
+
+=head1 SEE ALSO
+
+Tangram(3), Class::DBI(3), which have similar concepts, but are tied
+more closely to database structure.
+
+=head1 AUTHOR
+
+Nathan Gray, E<lt>kolibrie@cpan.orgE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2005 by Nathan Gray
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.4 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
