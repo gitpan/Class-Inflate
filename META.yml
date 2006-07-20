@@ -1,8 +1,17 @@
---- #YAML:1.0
+---
 name: Class-Inflate
-version: 0.01
+version: 0.03
 author:
-  - kolibrie <kolibrie@cpan.org>
+  - 'kolibrie <kolibrie@cpan.org>'
 abstract: Inflate HASH Object from Values in Database
 license: unknown
-generated_by: Module::Build version 0.261, without YAML.pm
+requires:
+  Devel::Messenger: 0
+build_requires:
+  DBD::SQLite: 0
+  Test::Debugger: 0
+provides:
+  Class::Inflate:
+    file: lib/Class/Inflate.pm
+    version: 0.03
+generated_by: Module::Build version 0.26

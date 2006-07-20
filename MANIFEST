@@ -2,6 +2,8 @@ Build.PL
 Changes
 Makefile.PL
 MANIFEST
+t/complex_join.t
+t/in.t
 t/one_to_one.t
 t/one_to_many.t
 lib/Class/Inflate.pm

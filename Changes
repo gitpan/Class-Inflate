@@ -1,5 +1,13 @@
 Revision history for Perl extension Class::Inflate.
 
+0.03  Mon Jan 30 16:31:49 2006
+	- set up default deflation
+
+0.02  Fri Nov  4 11:22:04 2005
+	- searches harder for a way to join tables
+	- added a way to specify default values to filter by
+	- added a postinflate hook
+
 0.01  Fri May 13 08:36:56 2005
 	- original version; created by h2xs 1.23 with options
 		-XA -b 5.6.0 -n Class::Inflate

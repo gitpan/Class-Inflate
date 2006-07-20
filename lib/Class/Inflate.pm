@@ -9,7 +9,8 @@ require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(inflate commit obliterate);
 our @EXPORT = ('inflate'); # @EXPORT_OK;
-our $VERSION = '0.01';
+our $VERSION = '0.03';
+$::OBJECT = undef;
 
 use Devel::Messenger qw(note);
 
@@ -87,7 +88,7 @@ sub _inflate {
 	foreach my $sql (@sql) {
 	    my @r = fetchrows($class, $dbh, $sql->{query}, $sql->{bind});
 	    $rows_fetched{$sql->{table}} = \@r;
-	    if (exists($persist->{$sql->{table}}{join})) {
+	    if (exists($persist->{$sql->{table}}{join}) and keys %{$persist->{$sql->{table}}{join}}) {
 	        foreach my $table (keys %{$persist->{$sql->{table}}{join}}) {
 		    note \3, "want to join $sql->{table} to $table\n";
 		    if (@data and $rows_fetched{$table}) {
@@ -141,10 +142,12 @@ sub inflation_sql {
     # newer code
     foreach my $table (keys %$inflation_fields) {
 	note \5, "building query for table $table\n";
+	my $table_filter = add_filter_defaults($class, $filter_values, $persist, $table);
 	my @tables = ();
 	my @fields = ();
 	my @filter = ();
 	my @bind   = ();
+	my $alias  = '';
         my $has_filter = exists($filter_values->{$table}) ? 1 : 0;
 	my $has_external_filter = scalar(keys %$filter_values) > $has_filter;
 	if ($has_external_filter) {
@@ -152,7 +155,7 @@ sub inflation_sql {
 	    my $matched = 0;
 	    my $need_join = 0;
 	    # add current table and fields
-	    my $alias = 'a';
+	    $alias = 'a';
 	    my %table_alias = ( $table => $alias );
 	    push @tables, $table . ' ' . $table_alias{$table};
 	    push @fields, map { $table_alias{$table} . '.' . $_ } @{$inflation_fields->{$table}};
@@ -177,14 +180,22 @@ sub inflation_sql {
 		next if ($external eq $table);
 		note \6, "will need to join from $table to $external\n";
 		# iterate through tables we know how to join to
-		my $next_path = join_path($persist, $external, keys %{$persist->{$table}{join}});
-		if (my @path = $next_path->()) {
-		    note \6, "path: " . join(' -> ', @path) . "\n";
-		    my $from = $table;
+		my $next_path = join_path($persist, $table, $external, exists($persist->{$table}{join}) ? keys %{$persist->{$table}{join}} : ());
+		my @path = $next_path->();
+		my $from = $table;
+		if (!@path and exists($persist->{$external}{join})) {
+		    note \6, "checking for reverse join definition\n";
+		    my $reverse_path = join_path($persist, $external, $table, keys %{$persist->{$external}{join}});
+		    @path = $reverse_path->();
+		    $from = $external
+		}
+		if (@path) {
+		    note \6, "path: " . join(' -> ', $from, @path) . "\n";
 		    foreach my $step (@path) {
 			# add external table
-			$table_alias{$step} = ++$alias unless (exists($table_alias{$step}));
-			push @tables, $step . ' ' . $table_alias{$step};
+			my $t = ($step eq $table) ? $external : $step;
+			$table_alias{$t} = ++$alias unless (exists($table_alias{$t}));
+			push @tables, $t . ' ' . $table_alias{$t};
 			$join_fields{$step} ||= [];
 			foreach my $field (keys %{$persist->{$from}{join}{$step}}) {
 			    note \6, '  joining ' . $from . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $step . '.' . $field . "\n";
@@ -202,8 +213,11 @@ sub inflation_sql {
 	    foreach my $external (keys %table_alias) {
 		# add external table conditions to filter
 		if (exists($filter_values->{$external})) {
-		    push @filter, map { $table_alias{$external} . '.' . $_ . ' = ?' } @{$filter_values->{$external}{fields}};
-		    push @bind, @{$filter_values->{$external}{values}};
+		    my $next_filter = expand_bind(sub { $table_alias{$external} . '.' . shift }, $filter_values->{$external}{fields}, $filter_values->{$external}{values});
+		    while (my ($f, $b) = $next_filter->()) {
+		        push @filter, $f;
+			push @bind, @$b;
+		    }
 		}
 	    }
 	    #if ($need_join) {
@@ -216,8 +230,19 @@ sub inflation_sql {
 	    push @tables, $table;
 	    push @fields, @{$inflation_fields->{$table}};
 	    if (exists($filter_values->{$table})) {
-		push @filter, map { $_ . ' = ?' } @{$filter_values->{$table}{fields}};
-		push @bind,   @{$filter_values->{$table}{values}};
+		my $next_filter = expand_bind(sub { shift }, $filter_values->{$table}{fields}, $filter_values->{$table}{values});
+		while (my ($f, $b) = $next_filter->()) {
+		    push @filter, $f;
+		    push @bind, @$b;
+		}
+	    }
+	}
+	if (keys %$table_filter) {
+	    my $prefix = $alias ? 'a.' : '';
+	    my $next_filter = expand_bind(sub { $prefix . shift }, $table_filter->{fields}, $table_filter->{values});
+	    while (my ($f, $b) = $next_filter->()) {
+		push @filter, $f;
+		push @bind, @$b;
 	    }
 	}
 	next unless @filter;
@@ -246,34 +271,68 @@ sub inflation_sql {
 	$query .= ' FROM ' . join(', ', @{$sql->{tables}});
 	$query .= ' WHERE ' . join(' AND ', @{$sql->{filter}});
 	$sql->{query} = $query;
-	note \5, 'built query: ' . $query . " -> " . join(', ', @{$sql->{bind}}) . "\n";
+	note \5, 'built query: ' . $query . " -> " . join(', ', map { defined($_) ? $_ : '' } @{$sql->{bind}}) . "\n";
     }
     return @sql if wantarray;
     return \@sql;
 }
 
+sub expand_bind {
+    # returns an iterator which returns a filter "$field = ?" and bind value
+    my $transform = shift;
+    my $fields = shift;
+    my $values = shift;
+    my $c = 0;
+    return sub {
+	return if ($c >= @$fields);
+	my $field = $transform->($fields->[$c]);
+	my $value = $values->[$c++];
+	my $operator = '=';
+	my $placeholder = '?';
+	if (UNIVERSAL::isa($value, 'ARRAY')) {
+	    if (@$value == 0) {
+	        push @$value, undef;
+	    } elsif (@$value > 1) {
+	        $operator = 'IN';
+		$placeholder = '(' . join(', ', map { '?' } @$value) . ')';
+	    }
+	} else {
+	    $value = [$value];
+	}
+	return ($field . ' ' . $operator . ' ' . $placeholder, $value);
+    }
+}
+
 sub join_path {
     # determine possible paths to join two tables together
     my $persist = shift;
+    my $launch = shift;
     my $target = shift;
     my @iterators = ();
-    note \7, "creating base iterator\n";
-    push @iterators, [member_of($target, @_), []];
+    my $spacing = '';
+    note \7, "creating iterator from $launch to $target\n";
+    push @iterators, [member_of($spacing, $target, @_), []];
     my $c = 0;
     return sub {
         while ($c < @iterators) {
 	    my ($element, $match) = $iterators[$c][0]->();
+	    $spacing = '  ' x @{$iterators[$c][1]};
 	    unless (defined($element)) {
-		note \7, "iterator $c is exhausted\n";
+		note \7, $spacing . "iterator $c is exhausted\n";
 		$c++;
 		next;
 	    }
 	    if ($match) {
-		note \7, "iterator $c found a join path: " . join(' -> ', @{$iterators[$c][1]}, $element) . "\n";
+		note \7, $spacing . "iterator $c found a join path: " . join(' -> ', @{$iterators[$c][1]}, $element) . "\n";
 	        return @{$iterators[$c][1]}, $element;
 	    } else {
-		note \7, "creating iterator from $element\n";
-	        push @iterators, [member_of($target, keys %{$persist->{$element}{join}}), [@{$iterators[$c][1]}, $element]];
+		if (grep { /^$element$/ } @{$iterators[$c][1]}) {
+		    note \7, $spacing . "search loop detected: " . join(' -> ', @{$iterators[$c][1]}, $element) . "\n";
+		} else {
+		    $spacing .= '  ';
+		    note \7, $spacing . "creating iterator from $element to $target\n";
+		    push @iterators, [member_of($spacing, $target, keys %{$persist->{$element}{join}}), [@{$iterators[$c][1]}, $element]];
+		}
 	    }
 	}
 	note \7, "all iterators exhausted\n";
@@ -283,9 +342,10 @@ sub join_path {
 
 sub member_of {
     # iterator to say if an element matches the target
+    my $spacing = shift || '';
     my $target = shift;
     my @possible = @_;
-    note \7, "  determining if $target is a member of: " . join('|', @possible) . "\n";
+    note \7, $spacing . "  determining if (" . join('|', @possible) . ") contains: $target\n";
     return sub {
         while (my $element = shift(@possible)) {
 	    return ($element, ($element eq $target));
@@ -365,15 +425,15 @@ sub filter_values {
 	my $field = $methods->{$method};
 	my @field = ();
 	my @value = ();
+	local $::OBJECT = $filter;
 	if (ref($field)) {
 	    if (ref($field) eq 'HASH' and exists($field->{fields})) {
 		push @field, ref($field->{fields}) eq 'ARRAY' ? @{$field->{fields}} : $field->{fields};
-		if (exists($field->{deflate})) {
-		    if (UNIVERSAL::can($filter, $method)) {
-			push @value, $field->{deflate}->($filter->$method());
-		    } else {
-			push @value, $field->{deflate}->($filter->{$method});
-		    }
+		my $deflate = exists($field->{deflate}) ? $field->{deflate} : sub { @_ };
+		if (UNIVERSAL::can($filter, $method)) {
+		    push @value, $deflate->($filter->$method());
+		} else {
+		    push @value, $deflate->($filter->{$method});
 		}
 	    }
 	} else {
@@ -397,6 +457,29 @@ sub filter_values {
     return \%values;
 }
 
+sub add_filter_defaults {
+    # add values from table filter hash, for fields which have not been set
+    my $class = shift;
+    my $filter_values = shift;
+    my $persist = shift;
+    my $table = shift;
+    my %new = ();
+    if (exists($persist->{$table}{filter}) and keys(%{$persist->{$table}{filter}})) {
+	note \6, "adding default filter values\n";
+	my %seen = ();
+	%seen = map { $_ => 1 } @{$filter_values->{$table}{fields}} if (exists($filter_values->{$table}));
+	my $default = $persist->{$table}{filter};
+        foreach my $field (keys %$default) {
+	    unless (exists($seen{$field})) {
+		push @{$new{fields}}, $field;
+		push @{$new{values}}, $default->{$field};
+		note \6, "  ($table.$field = $default->{$field})\n";
+	    }
+	}
+    }
+    return \%new;
+}
+
 sub fetchrows {
     my $class = shift;
     my $dbh = shift;
@@ -404,7 +487,7 @@ sub fetchrows {
     my $bind = shift;
     my @records = ();
     if ($dbh and my $sth = $dbh->prepare($query)) {
-	note \2, $sth->{Statement} . ' -> ' . join(', ', @$bind) . "\n";
+	note \2, $sth->{Statement} . ' -> ' . join(', ', map { defined($_) ? $_ : '' } @$bind) . "\n";
         if ($sth->execute(@$bind)) {
 	    while (my $record = $sth->fetchrow_hashref('NAME_lc')) {
 		push @records, $record;
@@ -469,6 +552,7 @@ sub inflated_object {
         return unless @$data;
 	my $d = shift(@$data);
 	my $object = $objects->[$c++] ||= $class->new();
+	local $::OBJECT = $object;
 	foreach my $table (keys %$d) {
 	    my $records = $d->{$table};
 	    note "[$c] inflating object $class with " . scalar(@$records) . " records from $table\n";
@@ -497,6 +581,9 @@ sub inflated_object {
 			    } else {
 				$object->$method(@values);
 			    }
+			    if (exists($field->{postinflate})) {
+			        $field->{postinflate}->();
+			    }
 			} else {
 			    # TODO some warning - can't run method on object
 			}
@@ -507,6 +594,9 @@ sub inflated_object {
 			        note \6, "  ( = $value)\n";
 			    }
 			    $object->$method(@values);
+			}
+			if (exists($field->{postinflate})) {
+			    $field->{postinflate}->();
 			}
 		    }
 		} else {
@@ -583,6 +673,33 @@ Class::Inflate - Inflate HASH Object from Values in Database
 
 Allows for any blessed HASH object to be populated from a database, by
 describing table relationships to each method.
+
+When specifying a database relationship to a method, there are several
+hooks you can specify:
+
+=over 4
+
+=item inflate
+
+Called when converting database values into method values.  Receives
+the values from the database fields specified.  The return values are 
+passed to the object accessor for the method.
+
+=item postinflate
+
+Called immediately after passing values to the object accessor.  The
+variable C<$::OBJECT> is available, and contains the object being populated.
+
+=item deflate
+
+Called when converting method values into database values.  Receives
+the values from the object accessor for the method.  The return values
+are passed to the database fields specified.
+
+=back
+
+The database fields are specified as an ARRAY reference of field names,
+if any of the hooks are used.
 
 =head2 EXPORT
 
