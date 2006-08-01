@@ -89,7 +89,7 @@ local *Class::Inflate::note = $note;
 use warnings;
 
 my $t = Test::Debugger->new(
-    'tests'    => 5,
+    'tests'    => 10,
     'start'    => 1,
     'log_file' => 'test.log',
 );
@@ -128,4 +128,24 @@ $t->ok('Nathan', $person->first_name, 'first_name');
 $t->ok('Gray', $person->last_name, 'last_name');
 $t->ok('Fairfax', $person->hometown, 'hometown');
 $t->ok('DC, VA', join(', ', sort @{$person->state}), 'state');
+
+$person = Class::Inflate::Test->new();
+$person->hometown('Fairfax');
+@objects = $person->inflate($dbh);
+
+$c = 0;
+foreach my $object (@objects) {
+    note "object " . ++$c . ":\n";
+    note Dumper($object) . "\n";
+}
+
+note "original object\n";
+note Dumper($person) . "\n";
+
+$t->ok(10, $person->id, 'id');
+$t->ok('Nathan', $person->first_name, 'first_name');
+$t->ok('Gray', $person->last_name, 'last_name');
+$t->ok('Fairfax', $person->hometown, 'hometown');
+$t->todo('DC, VA', join(', ', sort @{$person->state}), 'state');
+
 

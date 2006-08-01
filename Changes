@@ -1,5 +1,9 @@
 Revision history for Perl extension Class::Inflate.
 
+0.04  Thu Jul 27 16:40:23 2006
+	- search for multiple join paths when a single join may not be sufficient
+	  (not all fields in primary key are participating in join)
+
 0.03  Mon Jan 30 16:31:49 2006
 	- set up default deflation
 

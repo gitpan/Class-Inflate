@@ -20,7 +20,7 @@ my $b = $class->new(
 	'DBD::SQLite' => 0,
     },
     conflicts => {},
-    license => 'unknown',
+    license => 'perl',
     create_makefile_pl => 'passthrough',
     dist_author => 'kolibrie <kolibrie@cpan.org>',
     # not generated automatically by make2build.pl # TODO patch it

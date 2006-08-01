@@ -1,10 +1,10 @@
 ---
 name: Class-Inflate
-version: 0.03
+version: 0.04
 author:
   - 'kolibrie <kolibrie@cpan.org>'
 abstract: Inflate HASH Object from Values in Database
-license: unknown
+license: perl
 requires:
   Devel::Messenger: 0
 build_requires:
@@ -13,5 +13,5 @@ build_requires:
 provides:
   Class::Inflate:
     file: lib/Class/Inflate.pm
-    version: 0.03
+    version: 0.04
 generated_by: Module::Build version 0.26

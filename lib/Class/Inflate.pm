@@ -9,7 +9,7 @@ require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(inflate commit obliterate);
 our @EXPORT = ('inflate'); # @EXPORT_OK;
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 $::OBJECT = undef;
 
 use Devel::Messenger qw(note);
@@ -179,36 +179,68 @@ sub inflation_sql {
 	    foreach my $external (@aliases) {
 		next if ($external eq $table);
 		note \6, "will need to join from $table to $external\n";
+                my @pkey = exists($persist->{$table}{key}) ? @{$persist->{$table}{key}} : ();
 		# iterate through tables we know how to join to
 		my $next_path = join_path($persist, $table, $external, exists($persist->{$table}{join}) ? keys %{$persist->{$table}{join}} : ());
-		my @path = $next_path->();
-		my $from = $table;
-		if (!@path and exists($persist->{$external}{join})) {
+                my @paths = ();
+                my ($path, $join) = run_path_iterator($next_path, $persist->{$table}, 0);
+                push @paths, $path if @$path;
+                # if @path, but not all primary key fields are used in join, check for additional paths and possibly use multiple paths
+                while (@$path and grep { !$join->{$_} } @pkey) {
+                    note \6, "checking for additional join paths\n";
+                    ($path, $join) = run_path_iterator($next_path, $persist->{$table}, 0);
+                    push @paths, $path if @$path;
+                }
+		my $static_from = $table;
+		if (!@paths and exists($persist->{$external}{join})) {
 		    note \6, "checking for reverse join definition\n";
 		    my $reverse_path = join_path($persist, $external, $table, keys %{$persist->{$external}{join}});
-		    @path = $reverse_path->();
-		    $from = $external
+                    ($path, $join) = run_path_iterator($reverse_path, $persist->{$table}, -1);
+                    push @paths, $path if @$path;
+                    # if @path, but not all primary key fields are used in join, check for additional paths and possibly use multiple paths
+                    while (@$path and grep { !$join->{$_} } @pkey) {
+                        note \6, "checking for additional join paths\n";
+                        ($path, $join) = run_path_iterator($reverse_path, $persist->{$table}, -1);
+                        push @paths, $path if @$path;
+                    }
+		    $static_from = $external
 		}
-		if (@path) {
-		    note \6, "path: " . join(' -> ', $from, @path) . "\n";
-		    foreach my $step (@path) {
-			# add external table
-			my $t = ($step eq $table) ? $external : $step;
-			$table_alias{$t} = ++$alias unless (exists($table_alias{$t}));
-			push @tables, $t . ' ' . $table_alias{$t};
-			$join_fields{$step} ||= [];
-			foreach my $field (keys %{$persist->{$from}{join}{$step}}) {
-			    note \6, '  joining ' . $from . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $step . '.' . $field . "\n";
-			    push @filter, $table_alias{$from} . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $table_alias{$step} . '.' . $field;
-			    push @{$join_fields{$from}}, $persist->{$from}{join}{$step}{$field};
-			    push @{$join_fields{$step}}, $field;
-			}
-			$from = $step;
-		    }
-		} else {
-		    note \6, "no path from $table to $external found\n";
-		    delete $table_alias{$external};
-		}
+		# TODO check for a common table both ends know how to join to, if there is no direct join path
+                foreach my $path (@paths) {
+                    my $from = $static_from;
+                    note \6, "path: " . join(' -> ', $from, @$path) . "\n";
+                    foreach my $step (@$path) {
+                        # add external table
+                        my $t = ($step eq $table) ? $external : $step;
+                        $table_alias{$t} = ++$alias unless (exists($table_alias{$t}));
+                        push @tables, $t . ' ' . $table_alias{$t} unless (grep { $_ eq ($t . ' ' . $table_alias{$t}) } @tables);
+                        $join_fields{$step} ||= [];
+                        foreach my $field (keys %{$persist->{$from}{join}{$step}}) {
+                            my $join_from = $table_alias{$from} . '.' . $persist->{$from}{join}{$step}{$field};
+                            my $join_to   = $table_alias{$step} . '.' . $field;
+                            my $seen = 0;
+                            foreach my $filter_item (@filter) {
+                                if ($filter_item eq ($join_from . ' = ' . $join_to) or $filter_item eq ($join_to . ' = ' . $join_from)) {
+                                    $seen = 1;
+                                    last;
+                                }
+                            }
+                            if ($seen) {
+                                note \6, '  skipping ' . $from . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $step . '.' . $field . "\n";
+                                next;
+                            }
+                            note \6, '  joining ' . $from . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $step . '.' . $field . "\n";
+                            push @filter, $table_alias{$from} . '.' . $persist->{$from}{join}{$step}{$field} . ' = ' . $table_alias{$step} . '.' . $field;
+                            push @{$join_fields{$from}}, $persist->{$from}{join}{$step}{$field};
+                            push @{$join_fields{$step}}, $field;
+                        }
+                        $from = $step;
+                    }
+                }
+                unless (@paths) {
+                    note \6, "no path from $table to $external found\n";
+                    delete $table_alias{$external};
+                }
 	    }
 	    foreach my $external (keys %table_alias) {
 		# add external table conditions to filter
@@ -352,6 +384,17 @@ sub member_of {
 	}
 	return;
     }
+}
+
+sub run_path_iterator {
+    # kicks the iterator to find the next path. Returns the path, and fields it will use for the join
+    my $iterator = shift;
+    my $table_instructions = shift;
+    my $element = shift || 0; # expects 0 for forward, -1 for reverse path
+    my @path = $iterator->();
+    return (\@path, {}) unless @path;
+    my %join = map { $_ => 1 } (exists($table_instructions->{join}) and exists($table_instructions->{join}{$path[$element]})) ? values %{$table_instructions->{join}{$path[$element]}} : ();
+    return (\@path, \%join);
 }
 
 sub inflation_fields {
@@ -716,7 +759,7 @@ Nathan Gray, E<lt>kolibrie@cpan.orgE<gt>
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2005 by Nathan Gray
+Copyright (C) 2006 by Nathan Gray
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.4 or,
