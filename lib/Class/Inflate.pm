@@ -9,7 +9,7 @@ require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(inflate commit obliterate);
 our @EXPORT = ('inflate'); # @EXPORT_OK;
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 $::OBJECT = undef;
 
 use Devel::Messenger qw(note);
@@ -117,7 +117,7 @@ sub _inflate {
 	#use Data::Dumper;
 	#note "dataset:\n" . Dumper(\@data) . "\n";
 	my $inflated_object = inflated_object($class, $persist, \@data, [ref($self) ? $self : ()]);
-	while (my $record = $inflated_object->()) {
+	while (my $record = $inflated_object->($dbh)) {
 	    push @records, $record;
 	}
 	return @records if wantarray;
@@ -593,9 +593,11 @@ sub inflated_object {
     my $c = 0;
     return sub {
         return unless @$data;
+        my ($dbh) = @_;
 	my $d = shift(@$data);
 	my $object = $objects->[$c++] ||= $class->new();
 	local $::OBJECT = $object;
+        my @postinflate = ();
 	foreach my $table (keys %$d) {
 	    my $records = $d->{$table};
 	    note "[$c] inflating object $class with " . scalar(@$records) . " records from $table\n";
@@ -625,7 +627,7 @@ sub inflated_object {
 				$object->$method(@values);
 			    }
 			    if (exists($field->{postinflate})) {
-			        $field->{postinflate}->();
+                                push @postinflate, $field->{postinflate};
 			    }
 			} else {
 			    # TODO some warning - can't run method on object
@@ -639,7 +641,7 @@ sub inflated_object {
 			    $object->$method(@values);
 			}
 			if (exists($field->{postinflate})) {
-			    $field->{postinflate}->();
+                            push @postinflate, $field->{postinflate};
 			}
 		    }
 		} else {
@@ -656,6 +658,10 @@ sub inflated_object {
 		}
 	    }
 	}
+        note \6, "running postinflate hooks\n" if @postinflate;
+        foreach my $code (@postinflate) {
+            $code->($dbh);
+        }
 	return $object;
     };
 }
@@ -730,8 +736,11 @@ passed to the object accessor for the method.
 
 =item postinflate
 
-Called immediately after passing values to the object accessor.  The
-variable C<$::OBJECT> is available, and contains the object being populated.
+Called after object has been inflated. The variable C<$::OBJECT> is
+available, and contains the object being populated.
+
+The database handle used for inflation is available as the first
+argument to C<postinflate>.
 
 =item deflate
 
