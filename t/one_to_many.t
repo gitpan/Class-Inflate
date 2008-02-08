@@ -146,6 +146,6 @@ $t->ok(10, $person->id, 'id');
 $t->ok('Nathan', $person->first_name, 'first_name');
 $t->ok('Gray', $person->last_name, 'last_name');
 $t->ok('Fairfax', $person->hometown, 'hometown');
-$t->todo('DC, VA', join(', ', sort @{$person->state || []}), 'state');
+$t->ok('DC, VA', join(', ', sort @{$person->state || []}), 'state');
 
 

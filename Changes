@@ -1,5 +1,10 @@
 Revision history for Perl extension Class::Inflate.
 
+0.06  Fri Feb  8 13:20:10 2008
+	- wrote logic for joining through a central table
+	  (when tables know how to join to the central table, but the
+	  central table is unaware of how to join to them)
+
 0.05  Fri Nov 10 15:35:44 2006
 	- run postinflate hooks after inflation of whole object
 	- pass $dbh to postinflate
