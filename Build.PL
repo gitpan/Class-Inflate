@@ -33,10 +33,8 @@ __DATA__
 
 # Generated automatically from Build.PL
 
-use DBI;
 my $dbfile = 'dbfile';
 my $dsn = "dbi:SQLite:dbname=$dbfile";
-my $dbh = DBI->connect($dsn, '', '');
 
 my @setup = (
     'create table person (id number(2), first varchar(20), last varchar(20))',
@@ -80,7 +78,13 @@ my %data = (
 sub ACTION_test {
     my $self = shift;
     $self->notes('dsn' => $dsn);
+    eval { require DBI };
+    if ($@) {
+        warn "Cannot run tests without DBI: $!\n";
+        return;
+    }
     print "Generating test database\n";
+    my $dbh = DBI->connect($dsn, '', '');
     foreach my $query (@setup) {
 	$dbh->do($query);
     }
@@ -97,10 +101,14 @@ sub ACTION_test {
 
 sub ACTION_clean {
     my $self = shift;
-    print "Removing test database\n";
-    foreach my $table (keys %data) {
-	$dbh->do("drop table $table");
+    eval { require DBI };
+    unless ($@) {
+        print "Removing test database\n";
+        my $dbh = DBI->connect($dsn, '', '');
+        foreach my $table (keys %data) {
+            $dbh->do("drop table $table");
+        }
+        $self->add_to_cleanup($dbfile) if $dbfile;
     }
-    $self->add_to_cleanup($dbfile) if $dbfile;
     $self->SUPER::ACTION_clean;
 }

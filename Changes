@@ -1,5 +1,11 @@
 Revision history for Perl extension Class::Inflate.
 
+0.07  Mon Feb 11 16:30:55 2008
+	- join fetched records that formerly were forgotten
+	  (depending on which order the queries were run)
+	- changed Build.PL to not die when DBI is not installed
+	  (thank you David Golden and Andreas J. Koenig)
+
 0.06  Fri Feb  8 13:20:10 2008
 	- wrote logic for joining through a central table
 	  (when tables know how to join to the central table, but the

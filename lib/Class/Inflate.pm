@@ -9,7 +9,7 @@ require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(inflate commit obliterate);
 our @EXPORT = ('inflate'); # @EXPORT_OK;
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 $::OBJECT = undef;
 
 use Devel::Messenger qw(note);
@@ -107,10 +107,19 @@ sub _inflate {
 		note \3, "placed " . scalar(@data) . ' of ' . scalar(@r) . " records in dataset\n"; 
 	    }
 	    if (@data and $awaiting_join{$sql->{table}}) {
-		note \3, "now we have $sql->{table} data\n";
-		foreach my $table (@{$awaiting_join{$sql->{table}}}) {
-		    join_records($class, $persist, $sql->{table}, \@data, $table, $rows_fetched{$table});
-		}
+                my $join_awaiting_records;
+                # need to recursively call this foreach loop
+                $join_awaiting_records = sub {
+                    my $waiting = shift;
+                    return unless exists($awaiting_join{$waiting});
+                    note \3, "now we have $waiting data\n";
+                    while (@{$awaiting_join{$waiting}}) {
+                        my $table = shift @{$awaiting_join{$waiting}};
+                        join_records($class, $persist, $waiting, \@data, $table, $rows_fetched{$table});
+                        $join_awaiting_records->($table);
+                    }
+                };
+                $join_awaiting_records->($sql->{table});
 	    }
 	}
 	# TODO remove Dumper
